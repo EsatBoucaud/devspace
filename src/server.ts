@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -32,7 +33,7 @@ import { formatAgentsNotice, WorkspaceRegistry } from "./workspaces.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://pi-on-mcp/workspace-app.html";
-const WORKSPACE_APP_ASSET_VERSION = "20260531-4";
+const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 // Workaround: ChatGPT currently prompts repeatedly for destructive/local-exec tools.
 // Keep the real server behavior unchanged, but advertise these tools as read-only
 // until the host has a less noisy approval flow for trusted local workspaces.
@@ -46,6 +47,14 @@ interface RunningServer {
 type ToolContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
+
+interface WorkspaceAppManifestEntry {
+  file: string;
+  css?: string[];
+  isEntry?: boolean;
+}
+
+type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
 
 const storedToolNameSchema = z.enum([
   "open_workspace",
@@ -177,19 +186,50 @@ function newFilePatch(path: string, content: string): string {
 }
 
 function assetBaseUrl(config: ServerConfig): string {
-  return `${config.publicBaseUrl.replace(/\/+$/, "")}/mcp-app-assets/v/${WORKSPACE_APP_ASSET_VERSION}`;
+  return `${config.publicBaseUrl.replace(/\/+$/, "")}/mcp-app-assets`;
+}
+
+function uiManifestUrl(): URL {
+  return new URL("../dist/ui/.vite/manifest.json", import.meta.url);
+}
+
+function readWorkspaceAppManifest(): WorkspaceAppManifest {
+  return JSON.parse(readFileSync(uiManifestUrl(), "utf8")) as WorkspaceAppManifest;
+}
+
+function getWorkspaceAppManifestEntry(): WorkspaceAppManifestEntry {
+  const manifest = readWorkspaceAppManifest();
+  const entry = manifest[WORKSPACE_APP_MANIFEST_ENTRY];
+
+  if (!entry?.file) {
+    throw new Error(`Missing ${WORKSPACE_APP_MANIFEST_ENTRY} in UI manifest.`);
+  }
+
+  return entry;
+}
+
+function assetUrl(baseUrl: string, assetPath: string): string {
+  return `${baseUrl}/${assetPath.replace(/^\/+/, "")}`;
 }
 
 function workspaceAppHtml(config: ServerConfig): string {
   const baseUrl = assetBaseUrl(config);
+  const entry = getWorkspaceAppManifestEntry();
+  const stylesheets = (entry.css ?? [])
+    .map(
+      (stylesheet) =>
+        `    <link rel="stylesheet" crossorigin href="${assetUrl(baseUrl, stylesheet)}" />`,
+    )
+    .join("\n");
+
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Pi MCP Workspace</title>
-    <script type="module" crossorigin src="${baseUrl}/assets/workspace-app.js"></script>
-    <link rel="stylesheet" crossorigin href="${baseUrl}/assets/workspace-app.css" />
+    <script type="module" crossorigin src="${assetUrl(baseUrl, entry.file)}"></script>
+${stylesheets}
   </head>
   <body>
     <main id="app" class="shell">
@@ -222,10 +262,10 @@ function setAssetHeaders(res: Response): void {
 }
 
 async function assertWorkspaceAppAssets(): Promise<void> {
-  const candidates = [
-    new URL("../dist/ui/assets/workspace-app.js", import.meta.url),
-    new URL("../dist/ui/assets/workspace-app.css", import.meta.url),
-  ];
+  const entry = getWorkspaceAppManifestEntry();
+  const candidates = [entry.file, ...(entry.css ?? [])].map(
+    (assetPath) => new URL(`../dist/ui/${assetPath}`, import.meta.url),
+  );
 
   for (const candidate of candidates) {
     await access(candidate);
@@ -1085,16 +1125,6 @@ export function createServer(config = loadConfig()): RunningServer {
     setAssetHeaders(res);
     res.sendStatus(204);
   });
-
-  app.use(
-    `/mcp-app-assets/v/${WORKSPACE_APP_ASSET_VERSION}`,
-    express.static(uiBuildDirectory(), {
-      immutable: true,
-      maxAge: "1y",
-      fallthrough: false,
-      setHeaders: setAssetHeaders,
-    }),
-  );
 
   app.use(
     "/mcp-app-assets",
